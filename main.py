@@ -220,3 +220,21 @@ async def telegram_webhook(req: Request):
     except:
         tg_send(chat_id, f"No encontré '{food}'. Prueba otro nombre del catálogo.")
     return JSONResponse(content={"ok": True})
+@app.post("/webhook")
+async def telegram_webhook(request: Request):
+    update = await request.json()
+
+    # Log para verificar que llegan mensajes
+    print("INCOMING UPDATE:", update)
+
+    # Procesar mensaje
+    if "message" in update:
+        chat_id = update["message"]["chat"]["id"]
+        text = update["message"].get("text", "")
+
+        if text == "/start":
+            tg_send(chat_id, "Bot activo 🚀")
+        else:
+            tg_send(chat_id, f"Recibí: {text}")
+
+    return {"ok": True}
