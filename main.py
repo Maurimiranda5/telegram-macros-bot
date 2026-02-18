@@ -189,6 +189,12 @@ async def webhook(req: Request):
     chat_id = int(msg["chat"]["id"])
     text = (msg.get("text") or "").strip()
     from_user = msg.get("from") or {}
+    telegram_id = int(from_user.get("id", 0))
+display_name = (
+    (from_user.get("first_name") or "")
+    + (" " + from_user.get("last_name") if from_user.get("last_name") else "")
+).strip() or (from_user.get("username") or "Usuario")
+
 
     # asegurar user
     user_id = get_or_create_user(from_user)
@@ -239,7 +245,15 @@ async def webhook(req: Request):
     # 1) Activación
     if state == "AWAIT_CODE":
         code = text.strip()
-        ok, _, err = call_rpc_safe("activate_with_code", {"p_user_id": user_id, "p_code": code})
+        ok, _, err = call_rpc_safe(
+    "activate_with_code",
+    {
+        "p_code": code,
+        "p_display_name": display_name,
+        "p_telegram_id": telegram_id,
+    },
+)
+
         if not ok:
             tg_send(chat_id, f"⚠️ No pude validar el código. Intenta de nuevo.\nDetalle: {err}")
             return JSONResponse({"ok": True})
