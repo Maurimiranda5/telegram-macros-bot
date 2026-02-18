@@ -23,7 +23,7 @@ ACTIVITY_CHOICES = {
     "1.375": "Ligera",
     "1.55": "Moderada",
     "1.725": "Alta",
-    "1.9": "Muy alta (solo atletas)"
+    "1.9": "Muy alta (solo atletas)",
 }
 
 
@@ -58,7 +58,6 @@ def parse_food_grams(line: str):
     if not t:
         return None, None
 
-    # extraer gramos (último número)
     m = re.search(r"(\d+(?:[.,]\d+)?)\s*(g|gr|gramos)?\s*$", t, re.IGNORECASE)
     if not m:
         return None, None
@@ -101,7 +100,7 @@ def get_state(user_id: int):
 def set_state(user_id: int, state: str, data: dict):
     sb.table("user_state").upsert(
         {"user_id": user_id, "state": state, "data": data},
-        on_conflict="user_id"
+        on_conflict="user_id",
     ).execute()
 
 
@@ -181,7 +180,6 @@ def health():
 async def webhook(req: Request):
     update = await req.json()
 
-    # Telegram puede mandar diferentes tipos
     msg = update.get("message") or update.get("edited_message")
     if not msg:
         return JSONResponse({"ok": True})
@@ -189,18 +187,17 @@ async def webhook(req: Request):
     chat_id = int(msg["chat"]["id"])
     text = (msg.get("text") or "").strip()
     from_user = msg.get("from") or {}
-    telegram_id = int(from_user.get("id", 0))
-display_name = (
-    (from_user.get("first_name") or "")
-    + (" " + from_user.get("last_name") if from_user.get("last_name") else "")
-).strip() or (from_user.get("username") or "Usuario")
 
+    telegram_id = int(from_user.get("id", 0))
+    display_name = (
+        (from_user.get("first_name") or "")
+        + (" " + from_user.get("last_name") if from_user.get("last_name") else "")
+    ).strip() or (from_user.get("username") or "Usuario")
 
     # asegurar user
     user_id = get_or_create_user(from_user)
     state, data = get_state(user_id)
 
-    # defaults
     if not state:
         state = "NEW"
         data = {}
@@ -221,6 +218,7 @@ display_name = (
         prof = sb.table("user_profile").select(
             "kcal_target,protein_g,carbs_g,fats_g,goal,activity_factor,weight_kg,height_cm,age,sex"
         ).eq("user_id", user_id).limit(1).execute()
+
         if not prof.data:
             tg_send(chat_id, "Aún no tengo tu perfil. Escribe /start para comenzar.")
         else:
@@ -237,7 +235,7 @@ display_name = (
         return JSONResponse({"ok": True})
 
     # flujo principal
-    if state in ("NEW",):
+    if state == "NEW":
         set_state(user_id, "AWAIT_CODE", {})
         tg_send(chat_id, WELCOME)
         return JSONResponse({"ok": True})
@@ -246,13 +244,13 @@ display_name = (
     if state == "AWAIT_CODE":
         code = text.strip()
         ok, _, err = call_rpc_safe(
-    "activate_with_code",
-    {
-        "p_code": code,
-        "p_display_name": display_name,
-        "p_telegram_id": telegram_id,
-    },
-)
+            "activate_with_code",
+            {
+                "p_code": code,
+                "p_display_name": display_name,
+                "p_telegram_id": telegram_id,
+            },
+        )
 
         if not ok:
             tg_send(chat_id, f"⚠️ No pude validar el código. Intenta de nuevo.\nDetalle: {err}")
@@ -328,7 +326,7 @@ display_name = (
             return JSONResponse({"ok": True})
         data["goal"] = g
 
-        ok, rpc_data, err = call_rpc_safe(
+        ok, _, err = call_rpc_safe(
             "complete_onboarding",
             {
                 "p_user_id": user_id,
@@ -351,11 +349,8 @@ display_name = (
     # 3) Registro comidas
     if state == "READY":
         t = text.strip().upper()
-
-        # Si el usuario manda el tipo de comida
         if t in MEAL_TYPES:
-            data = {"meal_type": t}
-            set_state(user_id, "READY_MEAL_SELECTED", data)
+            set_state(user_id, "READY_MEAL_SELECTED", {"meal_type": t})
             tg_send(chat_id, f"✅ Ok. Envíame los items de {t} (uno por línea). Ej: pollo cocido 180g")
             return JSONResponse({"ok": True})
 
@@ -377,6 +372,7 @@ display_name = (
         today = dt.date.today().isoformat()
         success = 0
         fails = 0
+
         for line in lines:
             food_name, grams = parse_food_grams(line)
             if not food_name:
@@ -401,16 +397,14 @@ display_name = (
         if success == 0:
             tg_send(chat_id, UNKNOWN_FOOD)
         else:
-            msg = f"✅ Registré {success} item(s) en {meal_type}."
+            msg_out = f"✅ Registré {success} item(s) en {meal_type}."
             if fails:
-                msg += f"\n⚠️ {fails} no pude registrarlos (formato o alimento no encontrado)."
-            msg += "\n\n¿Quieres registrar más? (o escribe otro tipo: DESAYUNO/ALMUERZO/CENA/SNACK)"
-            tg_send(chat_id, msg)
+                msg_out += f"\n⚠️ {fails} no pude registrarlos (formato o alimento no encontrado)."
+            msg_out += "\n\n¿Quieres registrar más? (o escribe otro tipo: DESAYUNO/ALMUERZO/CENA/SNACK)"
+            tg_send(chat_id, msg_out)
 
-        # volver a READY para que elija tipo de comida otra vez
         set_state(user_id, "READY", {})
         return JSONResponse({"ok": True})
 
-    # fallback
     tg_send(chat_id, "Escribe /start para comenzar.")
     return JSONResponse({"ok": True})
