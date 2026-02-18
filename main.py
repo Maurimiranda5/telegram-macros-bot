@@ -1,420 +1,402 @@
 import os
 import re
-from datetime import date
-from typing import Any, Dict, Optional
-
+import datetime as dt
 import requests
+
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from supabase import create_client
 
 app = FastAPI()
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip()
-SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "").strip()
-
-if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
-    # Render va a mostrar este error en logs si faltan env vars
-    raise RuntimeError("Faltan SUPABASE_URL o SUPABASE_SERVICE_ROLE_KEY en Environment Variables")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+SUPABASE_URL = os.getenv("SUPABASE_URL", "")
+SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
 
 sb = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 
 MEAL_TYPES = {"DESAYUNO", "ALMUERZO", "CENA", "SNACK"}
+GOALS = {"DEFICIT", "VOLUMEN", "MANTENER"}
 
-ACTIVITY_MAP = {
-    "1.2": ("Sedentario", 1.2),
-    "1.375": ("Ligera", 1.375),
-    "1.55": ("Moderada", 1.55),
-    "1.725": ("Alta", 1.725),
-    "1.9": ("Muy Alta (atletas)", 1.9),
+ACTIVITY_CHOICES = {
+    "1.2": "Sedentario",
+    "1.375": "Ligera",
+    "1.55": "Moderada",
+    "1.725": "Alta",
+    "1.9": "Muy alta (solo atletas)"
 }
 
-GOALS = {"DEFICIT", "VOLUMEN"}  # según tu regla: deficit -400, volumen +300
 
-
-# -----------------------------
-# Telegram helpers
-# -----------------------------
-def tg_send(chat_id: int, text: str) -> None:
+# -------------------------
+# Helpers Telegram
+# -------------------------
+def tg_send(chat_id: int, text: str):
     if not TELEGRAM_TOKEN:
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    requests.post(url, json={"chat_id": chat_id, "text": text})
+    try:
+        requests.post(url, json={"chat_id": chat_id, "text": text}, timeout=10)
+    except Exception:
+        pass
 
 
-def normalize_text(s: str) -> str:
-    return re.sub(r"\s+", " ", (s or "").strip())
+def normalize_food_name(s: str) -> str:
+    s = s.strip().lower()
+    s = re.sub(r"\s+", " ", s)
+    return s
 
 
-# -----------------------------
-# DB helpers (Supabase tables)
-# Asumimos que existen:
-# - users: id (pk), telegram_chat_id (unique), display_name
-# - user_state: user_id (pk), step, data(json)
-# - user_profile: user_id (pk) ... macros
-# -----------------------------
-def get_or_create_user_id(chat_id: int, display_name: str) -> int:
-    # Busca por telegram_chat_id; si no existe, crea.
-    # Ajusta nombres de columna si tu tabla difiere.
-    res = (
-        sb.table("users")
-        .select("id")
-        .eq("telegram_chat_id", chat_id)
-        .limit(1)
-        .execute()
-    )
-    rows = res.data or []
-    if rows:
-        return int(rows[0]["id"])
+def parse_food_grams(line: str):
+    """
+    Acepta:
+      - "pollo cocido 180g"
+      - "pollo cocido 180"
+      - "arroz 200 g"
+    Devuelve (food_name, grams) o (None, None)
+    """
+    t = line.strip()
+    if not t:
+        return None, None
 
-    ins = (
-        sb.table("users")
-        .insert({"telegram_chat_id": chat_id, "display_name": display_name})
-        .execute()
-    )
-    return int(ins.data[0]["id"])
-
-
-def get_state(user_id: int) -> Dict[str, Any]:
-    res = sb.table("user_state").select("step,data").eq("user_id", user_id).limit(1).execute()
-    rows = res.data or []
-    if not rows:
-        return {"step": None, "data": {}}
-    return {"step": rows[0].get("step"), "data": rows[0].get("data") or {}}
-
-
-def set_state(user_id: int, step: Optional[str], data: Dict[str, Any]) -> None:
-    sb.table("user_state").upsert({"user_id": user_id, "step": step, "data": data}).execute()
-
-
-def clear_state(user_id: int) -> None:
-    # deja step None pero conserva data vacía
-    sb.table("user_state").upsert({"user_id": user_id, "step": None, "data": {}}).execute()
-
-
-def has_profile(user_id: int) -> bool:
-    res = sb.table("user_profile").select("user_id").eq("user_id", user_id).limit(1).execute()
-    return bool(res.data)
-
-
-# -----------------------------
-# Parsing de comida
-# Ej: "pollo cocido 180g" / "arroz 200" / "pepino 100 g"
-# -----------------------------
-FOOD_RE = re.compile(r"^(?P<name>.+?)\s+(?P<grams>\d+(?:[.,]\d+)?)\s*g?$", re.IGNORECASE)
-
-def parse_food_grams(text: str):
-    m = FOOD_RE.match(text.strip())
+    # extraer gramos (último número)
+    m = re.search(r"(\d+(?:[.,]\d+)?)\s*(g|gr|gramos)?\s*$", t, re.IGNORECASE)
     if not m:
-        return None
-    name = normalize_text(m.group("name"))
-    grams_raw = m.group("grams").replace(",", ".")
-    grams = float(grams_raw)
+        return None, None
+
+    grams = float(m.group(1).replace(",", "."))
+    name = t[: m.start()].strip()
+    name = normalize_food_name(name)
+
+    if not name or grams <= 0:
+        return None, None
     return name, grams
 
 
-# -----------------------------
-# UX messages
-# -----------------------------
-def onboarding_intro() -> str:
-    return (
-        "Perfecto. Vamos a armar tus macros.\n"
-        "Responde en este orden:\n"
-        "1) Sexo: H o M\n"
-        "2) Edad (años)\n"
-        "3) Talla (cm)\n"
-        "4) Peso (kg)\n"
-        "5) Actividad: 1.2 / 1.375 / 1.55 / 1.725 / 1.9\n"
-        "6) Objetivo: DEFICIT o VOLUMEN\n\n"
-        "Tip: 1.9 es para atletas; la mayoría usa 1.55 o 1.725."
-    )
+# -------------------------
+# Helpers DB (Supabase)
+# -------------------------
+def get_or_create_user(telegram_user: dict) -> int:
+    """
+    users: id (serial), telegram_id (unique), display_name
+    """
+    tg_id = int(telegram_user["id"])
+    display = telegram_user.get("first_name") or telegram_user.get("username") or "Usuario"
+
+    existing = sb.table("users").select("id").eq("telegram_id", tg_id).limit(1).execute()
+    if existing.data:
+        return int(existing.data[0]["id"])
+
+    ins = sb.table("users").insert({"telegram_id": tg_id, "display_name": display}).execute()
+    return int(ins.data[0]["id"])
 
 
-def activity_menu() -> str:
-    return (
-        "Elige tu actividad escribiendo el número:\n"
-        "1.2 Sedentario\n"
-        "1.375 Ligera\n"
-        "1.55 Moderada\n"
-        "1.725 Alta\n"
-        "1.9 Muy Alta (atletas)"
-    )
+def get_state(user_id: int):
+    res = sb.table("user_state").select("state,data").eq("user_id", user_id).limit(1).execute()
+    if not res.data:
+        return None, {}
+    row = res.data[0]
+    return row.get("state"), (row.get("data") or {})
 
 
-def help_text() -> str:
-    return (
-        "Comandos:\n"
-        "/start → iniciar\n"
-        "RESUMEN → ver objetivo + progreso hoy\n"
-        "DESAYUNO / ALMUERZO / CENA / SNACK → seleccionar comida\n"
-        "Luego escribe: <alimento> <gramos>\n"
-        "Ej: pollo cocido 180g\n"
-        "Ej: arroz 200\n"
-    )
+def set_state(user_id: int, state: str, data: dict):
+    sb.table("user_state").upsert(
+        {"user_id": user_id, "state": state, "data": data},
+        on_conflict="user_id"
+    ).execute()
 
 
-# -----------------------------
-# Core flow
-# -----------------------------
-def handle_start(chat_id: int, user_id: int) -> None:
-    st = get_state(user_id)
-    tg_send(chat_id, "¡Hola! 👋 Para comenzar, envíame tu código de acceso (ej: MVP-1001).")
-    set_state(user_id, "WAIT_CODE", st["data"] or {})
+def clear_state(user_id: int):
+    set_state(user_id, "READY", {})
 
 
-def handle_code(chat_id: int, user_id: int, code: str) -> None:
-    # RPC: activate_with_code(p_user_id, p_code)
+def call_rpc_safe(fn_name: str, payload: dict):
+    """
+    Llama RPC y devuelve (ok, data, error_text)
+    """
     try:
-        sb.rpc("activate_with_code", {"p_user_id": user_id, "p_code": code}).execute()
-        tg_send(chat_id, "✅ Código válido. " + onboarding_intro())
-        set_state(user_id, "ONB_SEX", {})
-    except Exception:
-        tg_send(chat_id, "❌ Código inválido. Intenta de nuevo (ej: MVP-1001).")
+        res = sb.rpc(fn_name, payload).execute()
+        return True, res.data, None
+    except Exception as e:
+        return False, None, str(e)
 
 
-def finalize_onboarding(chat_id: int, user_id: int, data: Dict[str, Any]) -> None:
-    # RPC: complete_onboarding(bigint,text,int,numeric,numeric,numeric,text)
-    payload = {
-        "p_user_id": user_id,
-        "p_sex": data["sex"],
-        "p_age": int(data["age"]),
-        "p_height_cm": float(data["height_cm"]),
-        "p_weight_kg": float(data["weight_kg"]),
-        "p_activity_factor": float(data["activity_factor"]),
-        "p_goal": data["goal"],
-    }
-    sb.rpc("complete_onboarding", payload).execute()
+# -------------------------
+# Copy de UX (mensajes)
+# -------------------------
+WELCOME = (
+    "👋 Hola! Soy tu bot de macros.\n\n"
+    "Para activar tu acceso, envíame tu código.\n"
+    "Ejemplo: MVP-1001"
+)
 
-    # Mensaje final con objetivo (lo leemos de user_profile)
-    prof = sb.table("user_profile").select("kcal_target,protein_g,carbs_g,fats_g").eq("user_id", user_id).limit(1).execute().data[0]
-    tg_send(
-        chat_id,
-        "✅ Listo. Tus macros quedaron así:\n"
-        f"- Calorías: {int(prof['kcal_target'])}\n"
-        f"- Proteína: {int(prof['protein_g'])} g\n"
-        f"- Carbos: {int(prof['carbs_g'])} g\n"
-        f"- Grasas: {int(prof['fats_g'])} g\n\n"
-        "Ahora puedes registrar comidas:\n"
-        "1) Escribe: ALMUERZO (o DESAYUNO/CENA/SNACK)\n"
-        "2) Luego: pollo cocido 180g\n\n"
-        "Escribe RESUMEN cuando quieras ver tu avance."
-    )
-    set_state(user_id, None, {"current_meal": "ALMUERZO"})  # default cómodo
+ASK_SEX = "1/6 ¿Eres H (hombre) o M (mujer)? Responde: H o M"
+ASK_AGE = "2/6 ¿Qué edad tienes? (solo número)"
+ASK_HEIGHT = "3/6 ¿Cuánto mides en cm? Ej: 163"
+ASK_WEIGHT = "4/6 ¿Cuánto pesas en kg? Ej: 67"
+ASK_ACTIVITY = (
+    "5/6 Elige tu nivel de actividad (responde el número):\n"
+    "1.2 Sedentario\n"
+    "1.375 Ligera\n"
+    "1.55 Moderada\n"
+    "1.725 Alta\n"
+    "1.9 Muy alta (solo atletas)"
+)
+ASK_GOAL = (
+    "6/6 ¿Objetivo?\n"
+    "Responde: DEFICIT o VOLUMEN o MANTENER\n"
+    "(Para simplificar: DEFICIT=-400 kcal, VOLUMEN=+300 kcal)"
+)
 
+READY_HELP = (
+    "✅ Listo. Ya tengo tus macros.\n\n"
+    "Para registrar comida:\n"
+    "1) Primero escribe el tipo: DESAYUNO / ALMUERZO / CENA / SNACK\n"
+    "2) Luego envía items como: \"pollo cocido 180g\"\n"
+    "   Puedes mandar varios (una línea por item).\n\n"
+    "Ejemplo:\n"
+    "ALMUERZO\n"
+    "pollo cocido 180g\n"
+    "arroz 200g\n\n"
+    "Comandos:\n"
+    "/status  (ver objetivo)\n"
+    "/reset   (reiniciar flujo)\n"
+)
 
-def handle_onboarding(chat_id: int, user_id: int, text: str) -> None:
-    st = get_state(user_id)
-    step = st["step"]
-    data = st["data"] or {}
-
-    t = normalize_text(text).upper()
-
-    if step == "ONB_SEX":
-        if t not in {"H", "M"}:
-            tg_send(chat_id, "Escribe solo: H o M")
-            return
-        data["sex"] = t
-        set_state(user_id, "ONB_AGE", data)
-        tg_send(chat_id, "Edad (años):")
-        return
-
-    if step == "ONB_AGE":
-        if not t.isdigit() or not (10 <= int(t) <= 90):
-            tg_send(chat_id, "Edad inválida. Ej: 34")
-            return
-        data["age"] = int(t)
-        set_state(user_id, "ONB_HEIGHT", data)
-        tg_send(chat_id, "Talla en cm (ej: 163):")
-        return
-
-    if step == "ONB_HEIGHT":
-        try:
-            h = float(t.replace(",", "."))
-            if not (120 <= h <= 230):
-                raise ValueError()
-        except Exception:
-            tg_send(chat_id, "Talla inválida. Ej: 163")
-            return
-        data["height_cm"] = h
-        set_state(user_id, "ONB_WEIGHT", data)
-        tg_send(chat_id, "Peso en kg (ej: 67):")
-        return
-
-    if step == "ONB_WEIGHT":
-        try:
-            w = float(t.replace(",", "."))
-            if not (35 <= w <= 250):
-                raise ValueError()
-        except Exception:
-            tg_send(chat_id, "Peso inválido. Ej: 67")
-            return
-        data["weight_kg"] = w
-        set_state(user_id, "ONB_ACTIVITY", data)
-        tg_send(chat_id, activity_menu())
-        return
-
-    if step == "ONB_ACTIVITY":
-        key = t.replace(" ", "")
-        if key not in ACTIVITY_MAP:
-            tg_send(chat_id, "Actividad inválida.\n" + activity_menu())
-            return
-        data["activity_factor"] = float(ACTIVITY_MAP[key][1])
-        set_state(user_id, "ONB_GOAL", data)
-        tg_send(chat_id, "Objetivo: DEFICIT o VOLUMEN")
-        return
-
-    if step == "ONB_GOAL":
-        if t not in GOALS:
-            tg_send(chat_id, "Objetivo inválido. Escribe: DEFICIT o VOLUMEN")
-            return
-        data["goal"] = t
-        finalize_onboarding(chat_id, user_id, data)
-        return
+UNKNOWN_FOOD = (
+    "No encontré ese alimento en el catálogo.\n"
+    "Prueba con un nombre exacto.\n"
+    "Ej: \"pollo cocido 180g\" o \"arroz 200g\""
+)
 
 
-def handle_summary(chat_id: int, user_id: int) -> None:
-    # objetivo
-    prof_res = sb.table("user_profile").select("kcal_target,protein_g,carbs_g,fats_g").eq("user_id", user_id).limit(1).execute()
-    if not prof_res.data:
-        tg_send(chat_id, "Aún no tienes macros. Escribe /start para iniciar.")
-        return
-    prof = prof_res.data[0]
-
-    # progreso del día (daily_log)
-    today = str(date.today())
-    log_res = sb.table("daily_log").select("total_kcal,total_p,total_c,total_f").eq("user_id", user_id).eq("day", today).limit(1).execute()
-    if log_res.data:
-        d = log_res.data[0]
-        msg = (
-            f"📊 RESUMEN {today}\n\n"
-            f"🎯 Objetivo:\n"
-            f"- Kcal: {int(prof['kcal_target'])}\n"
-            f"- P: {int(prof['protein_g'])} g | C: {int(prof['carbs_g'])} g | F: {int(prof['fats_g'])} g\n\n"
-            f"✅ Consumido:\n"
-            f"- Kcal: {int(float(d['total_kcal']))}\n"
-            f"- P: {round(float(d['total_p']),1)} g | C: {round(float(d['total_c']),1)} g | F: {round(float(d['total_f']),1)} g\n"
-        )
-    else:
-        msg = (
-            f"📊 RESUMEN {today}\n\n"
-            f"🎯 Objetivo:\n"
-            f"- Kcal: {int(prof['kcal_target'])}\n"
-            f"- P: {int(prof['protein_g'])} g | C: {int(prof['carbs_g'])} g | F: {int(prof['fats_g'])} g\n\n"
-            "✅ Consumido: 0 (aún no registraste comidas hoy)\n"
-        )
-    tg_send(chat_id, msg)
-
-
-def handle_meal_select(chat_id: int, user_id: int, meal: str) -> None:
-    st = get_state(user_id)
-    data = st["data"] or {}
-    data["current_meal"] = meal
-    set_state(user_id, None, data)
-    tg_send(chat_id, f"🍽️ Ok. Comida seleccionada: {meal}\nAhora escribe: <alimento> <gramos>\nEj: pollo cocido 180g")
-
-
-def handle_log_food(chat_id: int, user_id: int, text: str) -> None:
-    st = get_state(user_id)
-    data = st["data"] or {}
-    current_meal = data.get("current_meal") or "ALMUERZO"
-
-    parsed = parse_food_grams(text)
-    if not parsed:
-        tg_send(chat_id, "No entendí. Ejemplo: pollo cocido 180g\nO escribe RESUMEN / " + " / ".join(sorted(MEAL_TYPES)))
-        return
-
-    food_name, grams = parsed
-
-    # RPC log_food(p_user_id, p_meal_type, p_food_name, p_grams, p_day)
-    today = str(date.today())
-    try:
-        sb.rpc(
-            "log_food",
-            {
-                "p_user_id": user_id,
-                "p_meal_type": current_meal,
-                "p_food_name": food_name,
-                "p_grams": grams,
-                "p_day": today,
-            },
-        ).execute()
-        tg_send(chat_id, f"✅ Registrado: {food_name} ({grams:g}g) en {current_meal}.\nEscribe RESUMEN para ver tu avance.")
-    except Exception:
-        tg_send(
-            chat_id,
-            f"❌ No encontré “{food_name}” en tu catálogo.\n"
-            "Prueba con el nombre exacto (ej: pollo cocido, arroz, pepino).\n"
-            "Más adelante habilitamos AGREGAR para cargar productos nuevos."
-        )
-
-
-# -----------------------------
-# Routes
-# -----------------------------
+# -------------------------
+# Endpoints
+# -------------------------
 @app.get("/health")
 def health():
-    return {"ok": True, "status": "bot activo"}
+    return {"ok": True}
 
 
 @app.post("/webhook")
 async def webhook(req: Request):
     update = await req.json()
 
-    # Telegram update parsing
+    # Telegram puede mandar diferentes tipos
     msg = update.get("message") or update.get("edited_message")
     if not msg:
         return JSONResponse({"ok": True})
 
-    chat = msg.get("chat") or {}
-    chat_id = int(chat.get("id"))
+    chat_id = int(msg["chat"]["id"])
+    text = (msg.get("text") or "").strip()
     from_user = msg.get("from") or {}
-    display_name = normalize_text(from_user.get("first_name", "") + " " + from_user.get("last_name", ""))
-    display_name = display_name.strip() or (from_user.get("username") or "Usuario")
 
-    text = normalize_text(msg.get("text", ""))
+    # asegurar user
+    user_id = get_or_create_user(from_user)
+    state, data = get_state(user_id)
 
-    # Asegurar user_id
-    user_id = get_or_create_user_id(chat_id, display_name)
+    # defaults
+    if not state:
+        state = "NEW"
+        data = {}
+        set_state(user_id, state, data)
 
-    # Comandos básicos
-    if text.startswith("/start"):
-        handle_start(chat_id, user_id)
+    # comandos
+    if text.lower() == "/start":
+        set_state(user_id, "AWAIT_CODE", {})
+        tg_send(chat_id, WELCOME)
         return JSONResponse({"ok": True})
 
-    if text.upper() == "AYUDA":
-        tg_send(chat_id, help_text())
+    if text.lower() == "/reset":
+        set_state(user_id, "AWAIT_CODE", {})
+        tg_send(chat_id, "🔄 Reiniciado. " + WELCOME)
         return JSONResponse({"ok": True})
 
-    if text.upper() == "RESUMEN":
-        handle_summary(chat_id, user_id)
+    if text.lower() == "/status":
+        prof = sb.table("user_profile").select(
+            "kcal_target,protein_g,carbs_g,fats_g,goal,activity_factor,weight_kg,height_cm,age,sex"
+        ).eq("user_id", user_id).limit(1).execute()
+        if not prof.data:
+            tg_send(chat_id, "Aún no tengo tu perfil. Escribe /start para comenzar.")
+        else:
+            p = prof.data[0]
+            tg_send(
+                chat_id,
+                "📌 Tu objetivo:\n"
+                f"- Objetivo: {p.get('goal')}\n"
+                f"- Kcal: {p.get('kcal_target')}\n"
+                f"- Proteína: {p.get('protein_g')} g\n"
+                f"- Carbs: {p.get('carbs_g')} g\n"
+                f"- Grasas: {p.get('fats_g')} g\n"
+            )
         return JSONResponse({"ok": True})
 
-    # estado
-    st = get_state(user_id)
-    step = st["step"]
-
-    # Si está esperando código
-    if step == "WAIT_CODE":
-        handle_code(chat_id, user_id, text)
+    # flujo principal
+    if state in ("NEW",):
+        set_state(user_id, "AWAIT_CODE", {})
+        tg_send(chat_id, WELCOME)
         return JSONResponse({"ok": True})
 
-    # Si está en onboarding
-    if step and step.startswith("ONB_"):
-        handle_onboarding(chat_id, user_id, text)
+    # 1) Activación
+    if state == "AWAIT_CODE":
+        code = text.strip()
+        ok, _, err = call_rpc_safe("activate_with_code", {"p_user_id": user_id, "p_code": code})
+        if not ok:
+            tg_send(chat_id, f"⚠️ No pude validar el código. Intenta de nuevo.\nDetalle: {err}")
+            return JSONResponse({"ok": True})
+
+        set_state(user_id, "ONB_SEX", {})
+        tg_send(chat_id, "✅ Código válido.\n" + ASK_SEX)
         return JSONResponse({"ok": True})
 
-    # Si NO tiene perfil todavía, forzamos onboarding
-    if not has_profile(user_id):
-        tg_send(chat_id, "Primero configuramos tus macros. Escribe /start.")
+    # 2) Onboarding step-by-step
+    if state == "ONB_SEX":
+        t = text.strip().upper()
+        if t not in ("H", "M"):
+            tg_send(chat_id, "Responde solo H o M.")
+            return JSONResponse({"ok": True})
+        data["sex"] = t
+        set_state(user_id, "ONB_AGE", data)
+        tg_send(chat_id, ASK_AGE)
         return JSONResponse({"ok": True})
 
-    # Selección de comida
-    up = text.upper()
-    if up in MEAL_TYPES:
-        handle_meal_select(chat_id, user_id, up)
+    if state == "ONB_AGE":
+        if not text.isdigit():
+            tg_send(chat_id, "Edad inválida. Responde solo un número (ej: 34).")
+            return JSONResponse({"ok": True})
+        data["age"] = int(text)
+        set_state(user_id, "ONB_HEIGHT", data)
+        tg_send(chat_id, ASK_HEIGHT)
         return JSONResponse({"ok": True})
 
-    # Registrar alimento
-    handle_log_food(chat_id, user_id, text)
+    if state == "ONB_HEIGHT":
+        try:
+            h = float(text.replace(",", "."))
+            if h < 120 or h > 230:
+                raise ValueError()
+        except Exception:
+            tg_send(chat_id, "Altura inválida. Ej: 163")
+            return JSONResponse({"ok": True})
+        data["height_cm"] = h
+        set_state(user_id, "ONB_WEIGHT", data)
+        tg_send(chat_id, ASK_WEIGHT)
+        return JSONResponse({"ok": True})
+
+    if state == "ONB_WEIGHT":
+        try:
+            w = float(text.replace(",", "."))
+            if w < 30 or w > 250:
+                raise ValueError()
+        except Exception:
+            tg_send(chat_id, "Peso inválido. Ej: 67")
+            return JSONResponse({"ok": True})
+        data["weight_kg"] = w
+        set_state(user_id, "ONB_ACTIVITY", data)
+        tg_send(chat_id, ASK_ACTIVITY)
+        return JSONResponse({"ok": True})
+
+    if state == "ONB_ACTIVITY":
+        key = text.strip()
+        if key not in ACTIVITY_CHOICES:
+            tg_send(chat_id, "Elige uno de estos: 1.2, 1.375, 1.55, 1.725, 1.9")
+            return JSONResponse({"ok": True})
+        data["activity_factor"] = float(key)
+        set_state(user_id, "ONB_GOAL", data)
+        if key == "1.9":
+            tg_send(chat_id, "⚠️ 1.9 es para atletas. Si no eres atleta, usa 1.55 o 1.725.\n\n" + ASK_GOAL)
+        else:
+            tg_send(chat_id, ASK_GOAL)
+        return JSONResponse({"ok": True})
+
+    if state == "ONB_GOAL":
+        g = text.strip().upper()
+        if g not in GOALS:
+            tg_send(chat_id, "Responde: DEFICIT o VOLUMEN o MANTENER")
+            return JSONResponse({"ok": True})
+        data["goal"] = g
+
+        ok, rpc_data, err = call_rpc_safe(
+            "complete_onboarding",
+            {
+                "p_user_id": user_id,
+                "p_sex": data["sex"],
+                "p_age": int(data["age"]),
+                "p_height_cm": float(data["height_cm"]),
+                "p_weight_kg": float(data["weight_kg"]),
+                "p_activity_factor": float(data["activity_factor"]),
+                "p_goal": data["goal"],
+            },
+        )
+        if not ok:
+            tg_send(chat_id, f"⚠️ No pude calcular tus macros.\nDetalle: {err}")
+            return JSONResponse({"ok": True})
+
+        clear_state(user_id)
+        tg_send(chat_id, READY_HELP)
+        return JSONResponse({"ok": True})
+
+    # 3) Registro comidas
+    if state == "READY":
+        t = text.strip().upper()
+
+        # Si el usuario manda el tipo de comida
+        if t in MEAL_TYPES:
+            data = {"meal_type": t}
+            set_state(user_id, "READY_MEAL_SELECTED", data)
+            tg_send(chat_id, f"✅ Ok. Envíame los items de {t} (uno por línea). Ej: pollo cocido 180g")
+            return JSONResponse({"ok": True})
+
+        tg_send(chat_id, "Primero dime el tipo: DESAYUNO / ALMUERZO / CENA / SNACK")
+        return JSONResponse({"ok": True})
+
+    if state == "READY_MEAL_SELECTED":
+        meal_type = (data or {}).get("meal_type")
+        if not meal_type:
+            set_state(user_id, "READY", {})
+            tg_send(chat_id, "Se perdió el tipo de comida. Escribe: DESAYUNO / ALMUERZO / CENA / SNACK")
+            return JSONResponse({"ok": True})
+
+        lines = [l.strip() for l in text.splitlines() if l.strip()]
+        if not lines:
+            tg_send(chat_id, "Envíame al menos 1 item. Ej: arroz 200g")
+            return JSONResponse({"ok": True})
+
+        today = dt.date.today().isoformat()
+        success = 0
+        fails = 0
+        for line in lines:
+            food_name, grams = parse_food_grams(line)
+            if not food_name:
+                fails += 1
+                continue
+
+            ok, _, _ = call_rpc_safe(
+                "log_food",
+                {
+                    "p_user_id": user_id,
+                    "p_day": today,
+                    "p_meal_type": meal_type,
+                    "p_food_name": food_name,
+                    "p_grams": grams,
+                },
+            )
+            if ok:
+                success += 1
+            else:
+                fails += 1
+
+        if success == 0:
+            tg_send(chat_id, UNKNOWN_FOOD)
+        else:
+            msg = f"✅ Registré {success} item(s) en {meal_type}."
+            if fails:
+                msg += f"\n⚠️ {fails} no pude registrarlos (formato o alimento no encontrado)."
+            msg += "\n\n¿Quieres registrar más? (o escribe otro tipo: DESAYUNO/ALMUERZO/CENA/SNACK)"
+            tg_send(chat_id, msg)
+
+        # volver a READY para que elija tipo de comida otra vez
+        set_state(user_id, "READY", {})
+        return JSONResponse({"ok": True})
+
+    # fallback
+    tg_send(chat_id, "Escribe /start para comenzar.")
     return JSONResponse({"ok": True})
