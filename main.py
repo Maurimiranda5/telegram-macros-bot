@@ -23,7 +23,7 @@ ACTIVITY_CHOICES = {
     "1.375": "Ligera",
     "1.55": "Moderada",
     "1.725": "Alta",
-    "1.9": "Muy alta (solo atletas)",
+    "1.9": "Muy alta (solo atletas)"
 }
 
 
@@ -78,7 +78,7 @@ def get_or_create_user(telegram_user: dict) -> int:
     """
     users: id (serial), telegram_id (unique), display_name
     """
-    tg_id = int(telegram_user["id"])
+    tg_id = int(telegram_user.get("id", 0))
     display = telegram_user.get("first_name") or telegram_user.get("username") or "Usuario"
 
     existing = sb.table("users").select("id").eq("telegram_id", tg_id).limit(1).execute()
@@ -100,7 +100,7 @@ def get_state(user_id: int):
 def set_state(user_id: int, state: str, data: dict):
     sb.table("user_state").upsert(
         {"user_id": user_id, "state": state, "data": data},
-        on_conflict="user_id",
+        on_conflict="user_id"
     ).execute()
 
 
@@ -109,9 +109,6 @@ def clear_state(user_id: int):
 
 
 def call_rpc_safe(fn_name: str, payload: dict):
-    """
-    Llama RPC y devuelve (ok, data, error_text)
-    """
     try:
         res = sb.rpc(fn_name, payload).execute()
         return True, res.data, None
@@ -120,7 +117,7 @@ def call_rpc_safe(fn_name: str, payload: dict):
 
 
 # -------------------------
-# Copy de UX (mensajes)
+# UX copy
 # -------------------------
 WELCOME = (
     "👋 Hola! Soy tu bot de macros.\n\n"
@@ -186,15 +183,14 @@ async def webhook(req: Request):
 
     chat_id = int(msg["chat"]["id"])
     text = (msg.get("text") or "").strip()
-    from_user = msg.get("from") or {}
 
+    from_user = msg.get("from") or {}
     telegram_id = int(from_user.get("id", 0))
     display_name = (
         (from_user.get("first_name") or "")
         + (" " + from_user.get("last_name") if from_user.get("last_name") else "")
     ).strip() or (from_user.get("username") or "Usuario")
 
-    # asegurar user
     user_id = get_or_create_user(from_user)
     state, data = get_state(user_id)
 
@@ -218,7 +214,6 @@ async def webhook(req: Request):
         prof = sb.table("user_profile").select(
             "kcal_target,protein_g,carbs_g,fats_g,goal,activity_factor,weight_kg,height_cm,age,sex"
         ).eq("user_id", user_id).limit(1).execute()
-
         if not prof.data:
             tg_send(chat_id, "Aún no tengo tu perfil. Escribe /start para comenzar.")
         else:
@@ -235,7 +230,7 @@ async def webhook(req: Request):
         return JSONResponse({"ok": True})
 
     # flujo principal
-    if state == "NEW":
+    if state in ("NEW",):
         set_state(user_id, "AWAIT_CODE", {})
         tg_send(chat_id, WELCOME)
         return JSONResponse({"ok": True})
@@ -243,6 +238,7 @@ async def webhook(req: Request):
     # 1) Activación
     if state == "AWAIT_CODE":
         code = text.strip()
+
         ok, _, err = call_rpc_safe(
             "activate_with_code",
             {
@@ -260,7 +256,7 @@ async def webhook(req: Request):
         tg_send(chat_id, "✅ Código válido.\n" + ASK_SEX)
         return JSONResponse({"ok": True})
 
-    # 2) Onboarding step-by-step
+    # 2) Onboarding
     if state == "ONB_SEX":
         t = text.strip().upper()
         if t not in ("H", "M"):
@@ -397,11 +393,11 @@ async def webhook(req: Request):
         if success == 0:
             tg_send(chat_id, UNKNOWN_FOOD)
         else:
-            msg_out = f"✅ Registré {success} item(s) en {meal_type}."
+            msg = f"✅ Registré {success} item(s) en {meal_type}."
             if fails:
-                msg_out += f"\n⚠️ {fails} no pude registrarlos (formato o alimento no encontrado)."
-            msg_out += "\n\n¿Quieres registrar más? (o escribe otro tipo: DESAYUNO/ALMUERZO/CENA/SNACK)"
-            tg_send(chat_id, msg_out)
+                msg += f"\n⚠️ {fails} no pude registrarlos (formato o alimento no encontrado)."
+            msg += "\n\n¿Quieres registrar más? (o escribe otro tipo: DESAYUNO/ALMUERZO/CENA/SNACK)"
+            tg_send(chat_id, msg)
 
         set_state(user_id, "READY", {})
         return JSONResponse({"ok": True})
